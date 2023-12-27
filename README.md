@@ -203,11 +203,160 @@ crypto.pbkdf2('a', 'b', 100000, 512, 'sha512', () => {
 6: 592ms
 ```
 我们可以看到，"在libuv线程池中线程的数量为5个的情况下开启6个pbkdf2函数"和"在libuv线程池中线程的数量为4个(默认)的情况下开启5个pbkdf2函数"的效果如出一辙，基本上可以使用之前的解析来解释这个现象
-# node中的socketI/O(网络I/O)
-对于一个node程序来说，网络I/O使用的是单线程的epoll
+## 总结
+上面的内容实打实的说明了，node会使用线程池处理一些耗时任务
+# 文件I/O也会使用到线程池
+## 只使用fs的时间
+代码
+```js
+const fs = require("fs");
+const start = Date.now();
+fs.readFile("./pbkdf2.js", () => {
+  console.log(`fs: ${Date.now() - start}ms`);
+});
+```
+命令行结果
+```sh
+fs: 4ms
+```
+## 在fs之后开启pbkdf2
+代码
+```js
+const crypto = require("crypto");
+const fs = require("fs");
+const N_hash = 4;
 
-# node中的磁盘I/O或者加密计算
-node会使用libuv中的提供的线程池中的线程来处理
+const start = Date.now();
 
-# 数据库访问属于socketI/O
+fs.readFile("./pbkdf2.js", () => {
+  console.log(`fs: ${Date.now() - start}ms`);
+});
 
+const doHash = (i) => {
+  crypto.pbkdf2("a", "b", 100000, 512, "sha512", () => {
+    console.log(`hash${i}: ${Date.now() - start}ms`);
+  });
+};
+
+for (let i = 0; i < N_hash; i++) {
+  doHash(i);
+}
+```
+命令行结果
+```sh
+hash1: 1631ms
+fs: 1641ms
+hash2: 1662ms
+hash3: 1672ms
+hash0: 1680ms
+```
+为什么fs的时间从4ms变成了1641ms呢？
+在了解fs使用了线程池之前我们要先了解，fs.readFile其实做了两件事情
+一件事是open，另一件事是read
+这两件事情都会引起文件I/O发生系统调用
+从而效果就是下面的样子
+## 只open文件
+```js
+const crypto = require("crypto");
+const fs = require("fs");
+const N_hash = 4;
+
+const start = Date.now();
+
+fs.readFile("./pbkdf2.js", () => {
+  console.log(`fs: ${Date.now() - start}ms`);
+});
+
+const doHash = (i) => {
+  crypto.pbkdf2("a", "b", 100000, 512, "sha512", () => {
+    console.log(`hash${i}: ${Date.now() - start}ms`);
+  });
+};
+
+for (let i = 0; i < N_hash; i++) {
+  doHash(i);
+}
+```
+命令行结果
+```sh
+fs: 4ms
+hash1: 1454ms
+hash3: 1499ms
+hash0: 1546ms
+hash2: 1550ms
+```
+# 网络I/O不会使用到线程池
+对于一个node程序来说，网络I/O使用的是单线程的epoll机制
+## 开启四个请求
+```js
+const https = require("node:https");
+
+const N = 4;
+
+const start = Date.now();
+
+const doRequest = (i) => {
+  https
+    .request("https://www.baidu.com", (scoket) => {
+      scoket.on("data", () => {});
+      scoket.on("end", () => {
+        const end = Date.now();
+        console.log(`request${i}: ${end - start}ms`);
+      });
+    })
+    .end();
+};
+
+for (let i = 0; i < N; i++) {
+  doRequest(i);
+}
+```
+命令行结果
+```sh
+request1: 138ms
+request3: 144ms
+request0: 145ms
+request2: 146ms
+```
+## 开启十个请求
+```js
+const https = require("node:https");
+
+const N = 10;
+
+const start = Date.now();
+
+const doRequest = (i) => {
+  https
+    .request("https://www.baidu.com", (scoket) => {
+      scoket.on("data", () => {});
+      scoket.on("end", () => {
+        const end = Date.now();
+        console.log(`request${i}: ${end - start}ms`);
+      });
+    })
+    .end();
+};
+
+for (let i = 0; i < N; i++) {
+  doRequest(i);
+}
+```
+命令行结果
+```sh
+request0: 158ms
+request9: 159ms
+request4: 160ms
+request6: 161ms
+request2: 162ms
+request3: 163ms
+request1: 165ms
+request8: 166ms
+request7: 167ms
+```
+# epoll是什么，对标nginx
+# epoll在node时间循环的什么阶段，epoll都会处理什么？
+# 使用多进程充分利用CPU资源
+由于node是单线程，所以可以多开几个线程
+# cluster模块
+# pm2
