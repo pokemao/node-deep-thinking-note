@@ -355,7 +355,10 @@ request8: 166ms
 request7: 167ms
 ```
 # epoll是什么，对标nginx
+## 使用epoll编程的C代码
+## nginx内部使用epoll
 # epoll在node时间循环的什么阶段，epoll都会处理什么？
+## poll
 # 使用多进程充分利用CPU资源
 由于node是单线程，所以可以多开几个线程
 # cluster模块
