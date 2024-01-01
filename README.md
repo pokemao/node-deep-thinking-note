@@ -219,6 +219,8 @@ fs.readFile("./pbkdf2.js", () => {
 ```sh
 fs: 4ms
 ```
+我们从这里看到一次文件读取的速度是非常快的，那这个现象怎么能确定文件io会使用到线程池呢？
+我们接着看
 ## 在fs之后开启pbkdf2
 代码
 ```js
@@ -238,23 +240,29 @@ const doHash = (i) => {
   });
 };
 
-for (let i = 0; i < N_hash; i++) {
+for (let i = 1; i <= N_hash; i++) {
   doHash(i);
 }
 ```
 命令行结果
 ```sh
-hash1: 1631ms
+hash2: 1631ms
 fs: 1641ms
-hash2: 1662ms
-hash3: 1672ms
-hash0: 1680ms
+hash3: 1662ms
+hash4: 1672ms
+hash1: 1680ms
 ```
-为什么fs的时间从4ms变成了1641ms呢？
+为什么fs的时间从4ms变成了1641ms呢？解释了这个内容就能确定文件io会使用到线程池
 在了解fs使用了线程池之前我们要先了解，fs.readFile其实做了两件事情
 一件事是open，另一件事是read
 这两件事情都会引起文件I/O发生系统调用
 从而效果就是下面的样子
+![read和pbkdf2](./README_img/read和pbkdf2.png)
+在4ms之前，线程池中的线程在执行open，第一个pbkdf2，第二个pbkdf2，第三个pbkdf2
+当open开始调用的时候，线程池中的线程1发现这个线程中的open会是一个使线程进入到阻塞态的系统调用，虽然这个阻塞的系统调用很快就能完成，但是node并不能判断这个时间是多久，所以node会让线程1在执行到阻塞态的系统调用的时候，让出线程1的执行能力，把线程1放回到线程池中，执行线程池队列里面的下一条任务。
+也就是说线程1会在open执行完之后，继续执行线程池中的第四个pbkdf2，而open系统调用在打开完毕之后，会把read的任务加入到线程池的任务队列里面去，在线程池中有空闲线程的时候会去执行这个新加入的read任务
+在open执行完毕之后，线程池中的线程就在执行第四个pbkdf2，第一个pbkdf2，第二个pbkdf2，第三个pbkdf2
+从执行结果上看，第二个pbkdf2最先执行完毕，这个时候线程池中的线程3就空闲了，线程3就可以去执行线程池任务队列里面的read任务了
 ## 只open文件
 ```js
 const crypto = require("crypto");
@@ -285,6 +293,7 @@ hash3: 1499ms
 hash0: 1546ms
 hash2: 1550ms
 ```
+我们使用fs.open验证了fs.readFile是由open和read两个系统调用组成的
 # 网络I/O不会使用到线程池
 对于一个node程序来说，网络I/O使用的是单线程的epoll机制
 ## 开启四个请求
@@ -354,6 +363,7 @@ request1: 165ms
 request8: 166ms
 request7: 167ms
 ```
+通过四个请求和十个请求的对比发现没有什么延迟的现象，我们大致可以分析得出网络请求没有用到线程池，否则应该是request0-request3先完成(完成时间记为t0)，然后request4-request7再完成(完成时间记为t1 == 2 * t0)，最后是request8-request9(完成时间记为t2 == 3 * t0)
 # epoll是什么，对标nginx
 ## 使用epoll编程的C代码
 ## nginx内部使用epoll

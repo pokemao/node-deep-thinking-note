@@ -14,6 +14,6 @@ const doHash = (i) => {
   });
 };
 
-for (let i = 0; i < N_hash; i++) {
+for (let i = 1; i <= N_hash; i++) {
   doHash(i);
 }
