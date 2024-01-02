@@ -364,6 +364,116 @@ request8: 166ms
 request7: 167ms
 ```
 通过四个请求和十个请求的对比发现没有什么延迟的现象，我们大致可以分析得出网络请求没有用到线程池，否则应该是request0-request3先完成(完成时间记为t0)，然后request4-request7再完成(完成时间记为t1 == 2 * t0)，最后是request8-request9(完成时间记为t2 == 3 * t0)
+# 多进程模型
+## 单进程的node服务器存在的缺陷
+如果一个node服务器在响应会执行cpu密集型任务的请求的时候会发生什么事情
+单进程服务器代码：
+```js
+const Koa = require('koa')
+
+const app = new Koa()
+
+app.use((ctx, next) => {
+  if(ctx.url !== '/') {
+    ctx.body = 'no'
+    return 
+  }
+  const start = Date.now()
+  let end;
+  // 模拟cpu密集型的任务
+  // 使用下面的while循环，所有的请求服务器都要处理5s之后，才能返回
+  while((end = Date.now()) - start < 5000){}
+  ctx.body = "5s gone"
+})
+
+app.listen(8090, () => {
+  console.log('listen in 8090');
+})
+```
+后续操作：
+1. 打开两个浏览器的页
+2. 第一个页面请求http://localhost:8090，几乎同时在第二个页面请求http://localhost:8090
+3. 观察请求返回的时间
+效果：
+![单进程node服务器接受两个cpu密集型请求](./README_img/单进程node服务器接受两个cpu密集型请求.png)
+现象分析：
+![单进程node服务器响应时间分析](./README_img/单进程node服务器响应时间分析.png)
+从图片中可以看出，由于node是使用epoll来在一个单线程处理http.createServer(callback)中注册的callback的
+详细说就是一个请求到来的时候，node会在事件循环的poll阶段中，通过epoll知道这个请求的到来，然后也是通过epoll获取到这个请求对应的sokcet的fd(如果有多个请求同时到来会返回多个fd)，然后继续读取一个fd中的请求内容，然后调用callback处理这个请求，如果epoll返回了多个fd，那么久继续读取一个fd中的请求内容，然后调用callback处理这个请求，循环往复，直到所有的fd都被处理完毕。所以说每个请求的poll阶段中一个接着一个被处理的(处理的方式就是调用回调函数callback)，但是node执行时间循环是单线程执行的，所以在上面的例子中，第一个请求的callback需要5s完成然后返回给客户端，只有当一个请求的callback函数执行完毕之后事件循环线程才能继续执行第二个请求的callback函数，这个函数也需要5s，完成后返回响应给客户端，所以也就形成了上面的时间序列图像
+解决这个问题的方式：
+1. 对cpu密集型的任务使用进程间交互来解决
+2. 使用多进程架构
+上面的两个方法应该同时使用以提高node服务器的QPS
+## 多进程的node服务器
+多进程服务器代码：
+```js
+const Koa = require('koa')
+const cluster = require('node:cluster')
+const numCPUs = require('node:os').availableParallelism();
+const process = require('node:process');
+
+if(cluster.isPrimary) {
+  console.log(`Primary ${process.pid} is running`);
+
+  // Fork workers.
+  for (let i = 0; i < numCPUs; i++) {
+    cluster.fork();
+  }
+
+  cluster.on('exit', (worker, code, signal) => {
+    console.log(`worker ${worker.process.pid} died`);
+  });
+}else {
+  const app = new Koa()
+
+  app.use((ctx, next) => {
+    if(ctx.url !== '/') {
+      ctx.body = 'no'
+      return 
+    }
+    console.log(`Worker ${process.pid} started to server`);
+    const start = Date.now()
+    let end;
+    // 模拟cpu密集型的任务
+    // 使用下面的while循环，所有的请求服务器都要处理5s之后，才能返回
+    while((end = Date.now()) - start < 5000){}
+    ctx.body = "5s gone"
+  })
+  
+  app.listen(8999, () => {
+    console.log(`Worker ${process.pid} started and listened in 8999`);
+  })
+}
+```
+启动的时候的控制台打印
+```sh
+Primary 25468 is running
+Worker 25474 started and listened in 8999
+Worker 25472 started and listened in 8999
+Worker 25473 started and listened in 8999
+Worker 25469 started and listened in 8999
+Worker 25470 started and listened in 8999
+Worker 25476 started and listened in 8999
+Worker 25471 started and listened in 8999
+Worker 25475 started and listened in 8999
+```
+后续操作和之前的单进程node服务器的操作相同：
+1. 打开两个浏览器的页
+2. 第一个页面请求http://localhost:8090，几乎同时在第二个页面请求http://localhost:8090
+3. 观察请求返回的时间
+效果：
+1. 服务器控制台输出
+```sh
+Worker 25474 started to server
+Worker 25472 started to server
+```
+表示第一个浏览器的请求被工作进程25474处理，第二个浏览器的请求被工作进程25472处理
+2. 浏览器的devtools的network时间分析
+![单进程node服务器接受两个cpu密集型请求](./README_img/单进程node服务器接受两个cpu密集型请求.png)
+从左右两次请求的发起到响应时间都在5s左右可以看出，多进程node服务器并请求间相互阻塞的问题，并且我们还看到第二个浏览器发起的请求还比第一个浏览器发起的请求的响应时间要短呢！由于这里面是两个进程在处理这两个请求，所以也就没有什么手动切换浏览器的时间了
+现象分析：
+![多进程node服务器响应时间分析](./README_img/多进程node服务器响应时间分析.png)
+这次客户端发起的两个请求分别被不同的进程处理，每一个进程内部有各自的事件循环线程，所以相互之间不会阻塞，都能在收到请求之后立即开始5s的处理(执行callback函数)
 # epoll是什么，对标nginx
 ## 使用epoll编程的C代码
 ## nginx内部使用epoll
@@ -373,3 +483,69 @@ request7: 167ms
 由于node是单线程，所以可以多开几个线程
 # cluster模块
 # pm2
+
+
+从哪里开始讲起呢？
+就从一个例子开始讲起
+为什么要在node里面使用多进程？
+```js
+const Koa = require('koa')
+
+const app = new Koa()
+
+app.use((ctx, next) => {
+  if(ctx.url !== '/') {
+    ctx.body = 'no'
+    return 
+  }
+
+  const start = Date.now()
+  let end;
+  // 模拟cpu密集型的任务
+  // 使用下面的while循环，所有的请求服务器都要处理5s之后，才能返回
+  while((end = Date.now()) - start < 5000){}
+  ctx.body = "5s gone"
+})
+
+app.listen(8090, () => {
+  console.log('listen in 8090');
+})
+```
+
+poll事件阶段
+epoll_pwait 细节处理， socket
+nfds
+read
+unix域 socket epoll
+watcher
+
+node 网络请求的callback是单线程执行
+多进程，多线程 libuv 默认线程池里面的四个线程是没有关系的
+cluster ==》 child_process()
+
+
+多进程监听同一个端口的现象，很神奇是吗？
+ng， static静态文件，worker
+
+process.send('server', socket tcpserver udpserver)
+
+fd
+fork子进程 复制父进程的pcb task_struct exceve()加载器
+子进程可以看到父进程中所有的fd
+epoll fd
+
+高并发 抢占
+cluster
+
+负载均衡。。。
+
+部署node项目
+node ...
+
+单进程项目 使用 pm2
+
+整个的流程
+
+信号
+
+进程挂了即时开启
